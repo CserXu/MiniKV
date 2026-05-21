@@ -1,0 +1,9 @@
+/build
+/out
+/.vs
+/data/benchmark
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.log
