@@ -21,28 +21,41 @@ MiniKV is not a production database. It does not implement concurrency control, 
 ## Architecture
 
 ```mermaid
-graph TD
-    Client["Client API<br/>CLI / Benchmark"] --> DB["DB Facade"]
+graph TB
 
-    DB --> Cache["LRU Cache"]
-    DB --> WAL["WAL Log"]
-    DB --> MemTable["MemTable"]
+    Client["Client API / Benchmark"]
 
-    WAL --> Recovery["Startup Recovery"]
+    subgraph WritePath["Write Path"]
+        WAL["WAL Log"]
+        MemTable["MemTable"]
+        Flush["Flush Trigger"]
+        SSTable["Immutable SSTable"]
 
-    MemTable --> Flush["Flush Trigger"]
-    Flush --> SSTable["Immutable SSTable"]
-    SSTable --> Bloom["Bloom Filter"]
+        WAL --> MemTable
+        MemTable --> Flush
+        Flush --> SSTable
+    end
 
-    SSTable --> Compaction["Compaction"]
-    Compaction --> CompactFile["compact_1.data"]
+    subgraph ReadPath["Read Path"]
+        Cache["LRU Cache"]
+        Bloom["Bloom Filter"]
 
-    Client --> ReadPath["Read Path"]
-    ReadPath --> Cache
-    ReadPath --> MemTable
-    ReadPath --> Bloom
-    Bloom --> SSTable
-    CompactFile --> ReadPath
+        Cache --> SSTable
+        Bloom --> SSTable
+    end
+
+    subgraph Maintenance["Maintenance"]
+        Compaction["Compaction"]
+        CompactFile["Compacted SSTable"]
+
+        Compaction --> CompactFile
+    end
+
+    Client --> WAL
+    Client --> Cache
+    Client --> Bloom
+
+    SSTable --> Compaction
 ```
 
 ## Features
