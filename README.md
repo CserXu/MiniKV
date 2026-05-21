@@ -1,12 +1,12 @@
 # MiniKV
 
-MiniKV is a small educational key-value storage engine implemented in C++17. It follows a simplified LSM-Tree design and uses only STL, CMake, and local file I/O.
+MiniKV is a compact C++17 key-value storage engine inspired by LSM-Tree architecture. It is designed as an educational systems project for understanding write-ahead logging, in-memory buffering, immutable SSTables, cache-aware reads, Bloom Filter pruning, and basic compaction.
 
-The project focuses on clarity and modularity. It includes a write-ahead log, in-memory MemTable, immutable SSTable files, Bloom Filters, LRU Cache, basic compaction, configurable runtime parameters, and a standalone benchmark executable.
+The implementation uses STL containers, CMake, and local file I/O. It is intentionally small and readable, with clear module boundaries for storage-engine experimentation.
 
 ## Project Overview
 
-MiniKV provides a simple command-line KV database with three primary operations:
+MiniKV exposes a simple command-line key-value interface:
 
 ```text
 put <key> <value>
@@ -14,165 +14,80 @@ get <key>
 delete <key>
 ```
 
-Data is first written to a WAL, then stored in memory. When the MemTable reaches the configured flush threshold, it is flushed to sorted SSTable files under the project `data` directory. Reads check the cache first, then MemTable, then SSTables.
+The project uses an LSM-tree-inspired design because it favors write-heavy workloads by converting random updates into sequential disk writes. Writes are buffered in memory, flushed into immutable SSTable files, and later merged through compaction. This keeps the storage model approachable while still reflecting core ideas used in real storage engines.
 
-This project is intentionally compact. It is suitable for learning the core mechanics behind LSM-style storage systems without introducing advanced production concerns such as concurrent writes, snapshots, background compaction, checksums, or binary block formats.
+MiniKV is not a production database. It does not implement concurrency control, snapshots, block indexes, binary table formats, or distributed storage.
 
 ## Architecture
 
-MiniKV uses a layered storage architecture:
+```mermaid
+graph TD
+    Client["Client API<br/>CLI / Benchmark"] --> DB["DB Facade"]
 
-```text
-              +-------------------+
-              |   CLI / Benchmark |
-              +---------+---------+
-                        |
-                        v
-              +-------------------+
-              |        DB         |
-              +----+---------+----+
-                   |         |
-          get path |         | write path
-                   |         v
-                   |   +-----------+
-                   |   |    WAL    |  data/wal.log
-                   |   +-----------+
-                   |
-        +----------+----------+
-        |                     |
-        v                     v
-+---------------+     +---------------+
-|   LRU Cache   |     |   MemTable    |
-+---------------+     +---------------+
-                              |
-                              | flush threshold reached
-                              v
-                     +----------------+
-                     |    SSTable     |  data/sst_N.data
-                     +----------------+
-                              |
-                              | >= compaction threshold
-                              v
-                     +----------------+
-                     |   Compaction   |  data/compact_1.data
-                     +----------------+
-```
+    DB --> Cache["LRU Cache"]
+    DB --> WAL["WAL Log"]
+    DB --> MemTable["MemTable"]
 
-Read path:
+    WAL --> Recovery["Startup Recovery"]
 
-```text
-get(key)
-  |
-  +--> LRU Cache
-  |
-  +--> MemTable
-  |
-  +--> compact_1.data, then newer SSTables
-          |
-          +--> Bloom Filter check before file scan
-```
+    MemTable --> Flush["Flush Trigger"]
+    Flush --> SSTable["Immutable SSTable"]
+    SSTable --> Bloom["Bloom Filter"]
 
-Write path:
+    SSTable --> Compaction["Compaction"]
+    Compaction --> CompactFile["compact_1.data"]
 
-```text
-put/delete
-  |
-  +--> append WAL record
-  |
-  +--> update MemTable
-  |
-  +--> update/remove Cache entry
-  |
-  +--> flush MemTable to SSTable when threshold is reached
+    Client --> ReadPath["Read Path"]
+    ReadPath --> Cache
+    ReadPath --> MemTable
+    ReadPath --> Bloom
+    Bloom --> SSTable
+    CompactFile --> ReadPath
 ```
 
 ## Features
 
-- C++17 implementation using STL containers and file I/O
-- Command-line interface for `put`, `get`, and `delete`
-- Write-Ahead Logging in `data/wal.log`
-- WAL recovery on DB startup
+- Write-Ahead Logging with startup recovery
 - MemTable backed by `std::unordered_map`
-- SSTable flush to sorted text files
-- Tombstone-based delete using `__DELETE__`
-- Basic compaction into `data/compact_1.data`
-- Bloom Filter per SSTable for skipping unnecessary file scans
+- Sorted text SSTables in `key:value` format
+- Tombstone-based deletes using `__DELETE__`
+- Automatic MemTable flush
+- Basic SSTable compaction into `compact_1.data`
+- In-memory Bloom Filter per SSTable
 - LRU Cache implemented with `std::list` and `std::unordered_map`
-- Configurable system parameters via `data/config.txt`
-- Standalone benchmark target with throughput and storage statistics
-- Debug read logs:
-  - `[Cache Hit]`
-  - `[MemTable Hit]`
-  - `[SSTable Hit]`
-  - `[Not Found]`
+- Runtime configuration through `data/config.txt`
+- Standalone benchmark executable with storage and cache statistics
 
 ## Storage Flow
 
-### Put
+### Write Path
 
-1. Append `PUT key value` to `data/wal.log`.
-2. Insert or overwrite the key in MemTable.
-3. Update the LRU Cache entry.
-4. If MemTable key count reaches `flush_threshold`, flush to an SSTable.
-5. After a successful flush, clear MemTable and truncate WAL.
+Writes are first appended to the WAL for durability and then inserted into the MemTable. The LRU Cache is updated with the latest value. When the MemTable reaches the configured flush threshold, its contents are written into a new immutable SSTable and the WAL is truncated.
 
-### Get
+### Read Path
 
-1. Check LRU Cache.
-2. Check MemTable.
-3. Check SSTables.
-4. Before scanning an SSTable file, check its Bloom Filter.
-5. If Bloom Filter says the key is absent, skip that SSTable.
-6. If a tombstone value is found, return `NOT FOUND`.
+Reads check the LRU Cache first, then MemTable, then persisted tables. Before scanning an SSTable file, MiniKV checks that table's Bloom Filter and skips the file when the key is definitely absent. Tombstones are treated as deleted values.
 
-### Delete
+### Flush and Compaction
 
-1. Append `DEL key` to `data/wal.log`.
-2. Write a tombstone value `__DELETE__` to MemTable.
-3. Remove the key from LRU Cache.
-4. Tombstones are persisted during flush and removed during compaction.
-
-### Flush
-
-When MemTable reaches the configured threshold, MiniKV writes all current MemTable entries to a new sorted SSTable:
-
-```text
-data/sst_1.data
-data/sst_2.data
-data/sst_3.data
-```
-
-SSTable file format:
-
-```text
-key:value
-```
-
-### Compaction
-
-When the number of normal SSTable files reaches `compaction_threshold`, MiniKV:
-
-1. Reads compacted data if `compact_1.data` already exists.
-2. Reads normal SSTables from old to new.
-3. Merges keys so newer values overwrite older values.
-4. Drops tombstone entries.
-5. Writes the merged result to:
-
-```text
-data/compact_1.data
-```
-
-6. Deletes old `sst_*.data` files.
+Flush creates sorted `sst_N.data` files under `data/`. When the number of normal SSTables reaches the configured compaction threshold, MiniKV merges them into `compact_1.data`, keeps the newest value for each key, removes tombstones, and deletes the old SSTable files.
 
 ## Components
 
-### DB
+| Component | Responsibility |
+| --- | --- |
+| `DB` | Coordinates reads, writes, recovery, flush, compaction, cache, and configuration. |
+| `Config` | Loads `flush_threshold`, `cache_size`, and `compaction_threshold` from `data/config.txt`. |
+| `WAL` | Appends write records before MemTable mutation and replays them on startup. |
+| `MemTable` | Stores active key-value data in memory with tombstone support. |
+| `SSTable` | Manages immutable sorted table files, lookup order, Bloom Filters, and compaction. |
+| `BloomFilter` | Provides probabilistic SSTable pruning before file scans. |
+| `LRUCache` | Caches hot read results with hit/miss accounting. |
+| `Benchmark` | Measures write/read throughput and reports storage, cache, and Bloom Filter statistics. |
 
-`DB` is the main facade used by the CLI and benchmark. It coordinates WAL, MemTable, SSTable, Cache, configuration, recovery, flush, and read routing.
+## Configuration
 
-### Config
-
-`Config` loads tunable parameters from:
+MiniKV reads configuration from:
 
 ```text
 data/config.txt
@@ -186,7 +101,7 @@ cache_size=100
 compaction_threshold=3
 ```
 
-If the file is missing or a value is invalid, MiniKV uses defaults:
+If `config.txt` is missing, defaults are used:
 
 ```text
 flush_threshold = 5
@@ -194,90 +109,71 @@ cache_size = 100
 compaction_threshold = 3
 ```
 
-### WAL
-
-The WAL records writes before MemTable updates:
-
-```text
-PUT key value
-DEL key
-```
-
-On startup, DB replays `data/wal.log` to restore unflushed MemTable state.
-
-### MemTable
-
-MemTable stores active KV data in memory using:
-
-```cpp
-std::unordered_map<std::string, std::string>
-```
-
-Deletes are represented as tombstones.
-
-### SSTable
-
-SSTable files are immutable text files sorted by key. MiniKV scans them from newest to oldest after checking Bloom Filters.
-
-### Bloom Filter
-
-Each SSTable has an in-memory Bloom Filter. Filters are built:
-
-- during flush
-- during startup when existing SSTables are loaded
-- after compaction creates `compact_1.data`
-
-Bloom Filter statistics are exposed in benchmark output:
-
-- skip count
-- false positive count
-
-### LRU Cache
-
-The cache uses `std::list` plus `std::unordered_map` and defaults to capacity `100`, configurable via `cache_size`.
-
-### Benchmark
-
-`MiniKVBenchmark` writes 10,000 keys and performs 10,000 reads. The read workload uses an 80/20 distribution:
-
-- 80% of reads target the first 100 hot keys
-- 20% of reads target random keys across the full key range
+Invalid or unknown entries are ignored.
 
 ## Build
 
-MiniKV uses CMake and builds with Visual Studio 2022 CMake projects.
+MiniKV is built with CMake and C++17.
 
-Configure and build with CMake presets:
+Using CMake presets:
 
 ```powershell
 cmake --preset x64-debug
 cmake --build out/build/x64-debug
 ```
 
-Or open the project folder directly in Visual Studio 2022 and build the CMake targets:
+Visual Studio 2022 can also open the repository as a CMake project. The build defines two executable targets:
 
 - `MiniKV`
 - `MiniKVBenchmark`
 
-## Run Benchmark
+## Run
 
 From the project root:
+
+```powershell
+.\out\build\x64-debug\MiniKV.exe
+```
+
+Example commands:
+
+```text
+put name huiyu
+get name
+delete name
+```
+
+Runtime data is stored under the project `data/` directory.
+
+## Run Benchmark
 
 ```powershell
 .\out\build\x64-debug\MiniKVBenchmark.exe
 ```
 
-The benchmark uses:
+The benchmark writes 10,000 keys and then runs 10,000 reads using an 80/20 access pattern:
+
+- 80% of reads target the first 100 hot keys
+- 20% of reads target random keys across the full key range
+
+The benchmark is primarily useful for observing storage behavior and instrumentation:
+
+- put/get timing
+- flush count
+- SSTable count
+- cache hit ratio
+- Bloom Filter skip count
+- Bloom Filter false positive count
+
+Benchmark data is isolated under:
 
 ```text
 data/benchmark
 ```
 
-as an isolated data directory and removes old benchmark data before each run.
-
 ## Benchmark Example
 
-Example output:
+Example output format:
 
 ```text
 MiniKV Benchmark
@@ -295,7 +191,7 @@ Bloom filter skip count: 8758
 Bloom filter false positive count: 7
 ```
 
-Numbers vary by machine, build type, compiler settings, and existing configuration values.
+Exact values depend on build type, machine, filesystem state, and configuration.
 
 ## Directory Structure
 
@@ -305,8 +201,8 @@ MiniKV/
 ├── CMakePresets.json
 ├── README.md
 ├── data/
-│   ├── config.txt          optional
-│   ├── wal.log             generated at runtime
+│   ├── config.txt          optional runtime configuration
+│   ├── wal.log             generated by WAL
 │   ├── sst_N.data          generated by flush
 │   └── compact_1.data      generated by compaction
 ├── src/
@@ -331,12 +227,7 @@ MiniKV/
 
 ## Future Improvements
 
-- Use a binary SSTable format with block indexes
-- Persist Bloom Filters instead of rebuilding them on startup
-- Add checksums for WAL and SSTable records
-- Add unit tests for recovery, compaction, and cache behavior
-- Add range scan support
-- Add background flush and compaction
-- Add thread-safety for concurrent access
-- Add configurable Bloom Filter size and hash count
-- Improve benchmark coverage with mixed read/write workloads
+- Binary SSTable format with block-level layout
+- Multi-level compaction strategy
+- Concurrent read/write support
+- Persistent Bloom Filter metadata
